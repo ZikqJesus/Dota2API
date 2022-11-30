@@ -118,11 +118,11 @@ namespace DotaAPI
         {
             var messageMap = new Dictionary<uint, Action<IPacketGCMsg>>
             {
-                { ( uint )EGCBaseClientMsg.k_EMsgGCClientWelcome, OnClientWelcome },
-                { (uint) ESOMsg.k_ESOMsg_CacheSubscribed, CacheSubscribedHandle},
-                {(uint) ESOMsg.k_ESOMsg_CacheUnsubscribed, CacheUnSubscribedHandle},
-                { (uint) EDOTAGCMsg.k_EMsgClientToGCGetProfileCardResponse, OnProfileRequest},
-                { ( uint )EDOTAGCMsg.k_EMsgGCMatchDetailsResponse, OnMatchDetails },
+                { (uint)EGCBaseClientMsg.k_EMsgGCClientWelcome, OnClientWelcome },
+                { (uint)ESOMsg.k_ESOMsg_CacheSubscribed, CacheSubscribedHandle },
+                { (uint)ESOMsg.k_ESOMsg_CacheUnsubscribed, CacheUnSubscribedHandle },
+                { (uint)EDOTAGCMsg.k_EMsgClientToGCGetProfileCardResponse, OnProfileRequest },
+                { (uint)EDOTAGCMsg.k_EMsgGCMatchDetailsResponse, OnMatchDetails },
 
 
             };
