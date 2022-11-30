@@ -11,7 +11,7 @@ using Newtonsoft.Json;
 
 namespace DotaAPI
 {
-    internal class DotaClient
+    public class DotaClient
     {
         SteamClient client;
         SteamUser user;
