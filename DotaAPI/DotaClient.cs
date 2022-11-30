@@ -1,14 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Threading;
-
-using SteamKit2;
-using SteamKit2.Internal; // brings in our protobuf client messages
-using SteamKit2.GC; // brings in the GC related classes
-using SteamKit2.GC.Dota.Internal; // brings in dota specific protobuf messages
+﻿using SteamKit2;
+using SteamKit2.Internal;
+using SteamKit2.GC; 
+using SteamKit2.GC.Dota.Internal; 
 using DotaAPI.enums;
 using DotaAPI.utils;
 using ProtoBuf;
+using DotaAPI.DotaEventArgs;
+using System.Net;
+using Newtonsoft.Json;
 
 namespace DotaAPI
 {
@@ -28,11 +27,15 @@ namespace DotaAPI
         public ProfileCard profile;
         public CMsgDOTAMatch Match { get; private set; }
         CSODOTALobby Lobby;
-        public DotaClient(string username, string password, bool isDebug=false)
+        Dota2HeroesRequestResult herodata;
+
+        public DotaClient(string username, string password, string apikey, bool isDebug=false)
         {
             this.login = username;
             this.password = password;
             this.isDebug = isDebug;
+
+            herodata = GetHeroData(apikey);
 
             client = new SteamClient();
 
@@ -48,6 +51,10 @@ namespace DotaAPI
             var thread = new Thread(new ThreadStart(Wait));
             thread.Start();
         }
+
+        public event Action OnConnectedDota = delegate { };
+        public event EventHandler<UpdatedLobbyEventArgs> OnLobbyChanged;
+        public event EventHandler<MatchEndEventArgs> OnMatchEnd;
         public void Connect()
         {
             client.Connect();
@@ -55,22 +62,18 @@ namespace DotaAPI
             {
 
             }
+            OnConnectedDota();
         }
 
         public void OnConnected(SteamClient.ConnectedCallback callback)
         {
             user.LogOn(new SteamUser.LogOnDetails { Username = login, Password = password });
-            if (isDebug)
-            {
-                Console.WriteLine("Connected!");
-            }
             
         }
         public void Wait()
         {
             while (!flag)
             {
-                // continue running callbacks until we get match details
                 callbackManager.RunWaitCallbacks(TimeSpan.FromSeconds(1));
             }
         }
@@ -78,39 +81,29 @@ namespace DotaAPI
         {
             if (callback.Result != EResult.OK)
             {
-                // logon failed (password incorrect, steamguard enabled, etc)
-                // an EResult of AccountLogonDenied means the account has SteamGuard enabled and an email containing the authcode was sent
-                // in that case, you would get the auth code from the email and provide it in the LogOnDetails
+
 
                 Console.WriteLine("Unable to logon to Steam: {0}", callback.Result);
 
-                flag = true; // we didn't actually get the match details, but we need to jump out of the callback loop
+                flag = true; 
                 return;
             }
 
             if (isDebug)
                 Console.WriteLine("Logged in! Launching DOTA...");
 
-            // we've logged into the account
-            // now we need to inform the steam server that we're playing dota (in order to receive GC messages)
-
-            // steamkit doesn't expose the "play game" message through any handler, so we'll just send the message manually
             var playGame = new ClientMsgProtobuf<CMsgClientGamesPlayed>(EMsg.ClientGamesPlayed);
 
             playGame.Body.games_played.Add(new CMsgClientGamesPlayed.GamePlayed
             {
-                game_id = new GameID(APPID), // or game_id = APPID,
+                game_id = new GameID(APPID), 
             });
 
-            // send it off
-            // notice here we're sending this message directly using the SteamClient
             client.Send(playGame);
 
-            // delay a little to give steam some time to establish a GC connection to us
             Thread.Sleep(5000);
 
-            // inform the dota GC that we want a session
-            var clientHello = new ClientGCMsgProtobuf<SteamKit2.GC.Dota.Internal.CMsgClientHello>((uint)EGCBaseClientMsg.k_EMsgGCClientHello);
+            var clientHello = new ClientGCMsgProtobuf<CMsgClientHello>((uint)EGCBaseClientMsg.k_EMsgGCClientHello);
             clientHello.Body.engine = ESourceEngine.k_ESE_Source2;
             coordinator.Send(clientHello, APPID);
             if (isDebug)
@@ -118,39 +111,182 @@ namespace DotaAPI
         }
         private void Waiting()
         {
-            Thread.Sleep(2000);
+            Thread.Sleep(500);
         }
 
         void OnGCMessage(SteamGameCoordinator.MessageCallback callback)
         {
-            // setup our dispatch table for messages
-            // this makes the code cleaner and easier to maintain
             var messageMap = new Dictionary<uint, Action<IPacketGCMsg>>
             {
                 { ( uint )EGCBaseClientMsg.k_EMsgGCClientWelcome, OnClientWelcome },
-                { (uint) EDOTAGCMsg.k_EMsgGCPracticeLobbyJoinResponse, OnLobbyCreated},
-                {(uint) EDOTAGCMsg.k_EMsgClientToGCGetProfileCardResponse, OnProfileRequest},
+                { (uint) ESOMsg.k_ESOMsg_CacheSubscribed, CacheSubscribedHandle},
+                {(uint) ESOMsg.k_ESOMsg_CacheUnsubscribed, CacheUnSubscribedHandle},
+                { (uint) EDOTAGCMsg.k_EMsgClientToGCGetProfileCardResponse, OnProfileRequest},
                 { ( uint )EDOTAGCMsg.k_EMsgGCMatchDetailsResponse, OnMatchDetails },
+
 
             };
 
             Action<IPacketGCMsg> func;
             if (!messageMap.TryGetValue(callback.EMsg, out func))
             {
-                // this will happen when we recieve some GC messages that we're not handling
-                // this is okay because we're handling every essential message, and the rest can be ignored
                 return;
             }
 
             func(callback.Message);
         }
 
+        private void CacheUnSubscribedHandle(IPacketGCMsg packetMsg)
+        {
+            var unSub = new ClientGCMsgProtobuf<CMsgSOCacheUnsubscribed>(packetMsg);
+            if (Lobby != null && unSub.Body.owner_soid.id == Lobby.lobby_id)
+            {
+                UpdatedLobbyEventArgs e = new()
+                {
+                    OldLobby = Lobby,
+                    NewLobby = null
+                };
+                Lobby = null;
+               
+                EventHandler<UpdatedLobbyEventArgs> handler = OnLobbyChanged;
+                if (handler != null)
+                {
+                    handler(this, e);
+                }
+            }
+        }
+        public void LaunchLobby()
+        {
+            var request = new ClientGCMsgProtobuf<CMsgPracticeLobbyLaunch>((uint)EDOTAGCMsg.k_EMsgGCPracticeLobbyLaunch);
+            coordinator.Send(request, APPID);
+            
+            if (isDebug)
+            {
+                Console.WriteLine("Lobby started!");
+            }
+
+            Waiting();
+
+            var thread = new Thread(new ThreadStart(LobbyStatusCheck));
+            thread.Start();
+
+        }
+        private Dota2HeroesRequestResult GetHeroData(string APIKey) 
+        {
+            string data = "";
+            using (WebClient client = new WebClient()) 
+            {
+                data = client.DownloadString("https://api.steampowered.com/IEconDOTA2_570/GetHeroes/v0001/?key=" + APIKey);
+            }
+            try 
+            {
+                return JsonConvert.DeserializeObject<Dota2HeroesRequestResult>(data);
+            } 
+            catch 
+            {
+                return null;
+            }
+        }
+        private string GetHeroName(uint id)
+        {
+            if (herodata == null || id < 1)
+            {
+                return "no_hero";
+            }
+            Hero hero = herodata.result.heroes.ToList().Find(h => { return h.id == id; });
+            if (hero == null)
+            {
+                return "no_hero";
+            }
+            return hero.name;
+        }
+        private void MatchEnd(MatchEndEventArgs e)
+        {
+            var outcome = e.Lobby.match_outcome;
+            if (outcome == EMatchOutcome.k_EMatchOutcome_RadVictory)
+            {
+                e.Winner = DotaTeam.Radiant;
+            }
+            else if (outcome == EMatchOutcome.k_EMatchOutcome_DireVictory)
+            {
+                e.Winner = DotaTeam.Dire;
+            }
+            else
+            {
+                return;
+            }
+            EventHandler<MatchEndEventArgs> handler = OnMatchEnd;
+            if (handler != null)
+            {
+                handler(this, e);
+            }
+
+        }
+        private void LobbyStatusCheck()
+        {
+            while (true)
+            {
+                if ((DotaGameState)Lobby.game_state == DotaGameState.DOTA_GAMERULES_STATE_GAME_IN_PROGRESS)
+                    break;
+            }
+            if (Lobby != null)
+            {
+                Thread.Sleep(5000);
+                List<CSODOTALobbyMember> players = Lobby.all_members;
+
+                List<string> RadiantHeroes = new List<string>();
+                List<string> DireHeroes = new List<string>();
+                List<string> RadiantPlayers = new();
+                List<string> DirePlayers = new();
+
+                foreach (CSODOTALobbyMember player in players)
+                {
+                    if (player.team == DOTA_GC_TEAM.DOTA_GC_TEAM_GOOD_GUYS)
+                    {
+                        string heroName = GetHeroName(player.hero_id);
+                        RadiantHeroes.Add(heroName);
+                        RadiantPlayers.Add(player.name);
+                    }
+                    else if (player.team == DOTA_GC_TEAM.DOTA_GC_TEAM_BAD_GUYS)
+                    {
+                        string heroName = GetHeroName(player.hero_id);
+                        DireHeroes.Add(heroName);
+                        DirePlayers.Add(player.name);
+                    }
+                }
+                MatchEndEventArgs e = new()
+                {
+                    DireHeroes = DireHeroes,
+                    RadiantHeroes = RadiantHeroes,
+                    Lobby = Lobby,
+                    DirePlayers = DirePlayers,
+                    RadiantPlayers = RadiantPlayers
+                };
+                while (true)
+                {
+                    if (Lobby == null)
+                    {
+                        break;
+                    }
+                    if (Lobby.match_outcome != EMatchOutcome.k_EMatchOutcome_Unknown)
+                    {
+                        e.Lobby.match_outcome = Lobby.match_outcome;
+                    }
+                    
+                }
+                e.Lobby.match_outcome = EMatchOutcome.k_EMatchOutcome_Unknown;
+
+                MatchEnd(e);
+            }
+
+        }
         public void GetMatchDetails(uint match_id)
         {
             var requestMatch = new ClientGCMsgProtobuf<CMsgGCMatchDetailsRequest>((uint)EDOTAGCMsg.k_EMsgGCMatchDetailsRequest);
             requestMatch.Body.match_id = match_id;
 
             coordinator.Send(requestMatch, APPID);
+            
             Waiting();
         }
         private void OnMatchDetails(IPacketGCMsg obj)
@@ -166,38 +302,82 @@ namespace DotaAPI
             Match = msg.Body.match;
         }
 
-        // this message arrives when the GC welcomes a client
-        // this happens after telling steam that we launched dota (with the ClientGamesPlayed message)
-        // this can also happen after the GC has restarted (due to a crash or new version)
-        void OnLobbyCreated(IPacketGCMsg packetMsg)
+        void CacheSubscribedHandle(IPacketGCMsg packetMsg)
         {
-            
+            var msg = new ClientGCMsgProtobuf<CMsgSOCacheSubscribed>(packetMsg);
+            foreach (var cache in msg.Body.objects)
+            {
+                SubscribedType(cache);
+            }
         }
+
+        void SubscribedType(CMsgSOCacheSubscribed.SubscribedType type)
+        {
+            switch ((UpdateTypes)type.type_id)
+            {
+                case UpdateTypes.LOBBY:
+                    OnLobbyUpdated(type.object_data[0]);
+                    break;
+            }
+        }
+        void OnLobbyUpdated(byte[] data)
+        {
+            CSODOTALobby lob;
+            using (var stream = new MemoryStream(data))
+            {
+                lob = Serializer.Deserialize<CSODOTALobby>(stream);
+                Lobby = lob;
+            }
+            
+            UpdatedLobbyEventArgs e = new()
+            {
+                OldLobby = Lobby,
+                NewLobby = lob
+            };
+
+            EventHandler<UpdatedLobbyEventArgs> handler = OnLobbyChanged;
+            if (handler != null)
+            {
+                handler(this, e);
+            }
+        }
+
         void OnClientWelcome(IPacketGCMsg packetMsg)
         {
-            // in order to get at the contents of the message, we need to create a ClientGCMsgProtobuf from the packet message we recieve
-            // note here the difference between ClientGCMsgProtobuf and the ClientMsgProtobuf used when sending ClientGamesPlayed
-            // this message is used for the GC, while the other is used for general steam messages
             var msg = new ClientGCMsgProtobuf<CMsgClientWelcome>(packetMsg);
             if (isDebug)
                 Console.WriteLine("GC is welcoming us. Version: {0}", msg.Body.version);
             isConnected = true;
-            // at this point, the GC is now ready to accept messages from us
-            // so now we'll request the details of the match we're looking for
         }
         public void CreateLobby(string name, string password="", Gamemodes gamemode=Gamemodes.AP, Regions region=Regions.STOCKHOLM)
         {
-            var requestMatch = new ClientGCMsgProtobuf<CMsgPracticeLobbyCreate>((uint)EDOTAGCMsg.k_EMsgGCPracticeLobbyCreate);
-            requestMatch.Body.lobby_details = new CMsgPracticeLobbySetDetails();
-            requestMatch.Body.lobby_details.game_mode = (uint)gamemode;
-            requestMatch.Body.lobby_details.game_name = name;
-            requestMatch.Body.lobby_details.pass_key = password;
-            requestMatch.Body.lobby_details.server_region = (uint)region;
+            if (Lobby != null)
+            {
+                Console.WriteLine("Lobby already created!");
+                return;
+            }
+            var request = new ClientGCMsgProtobuf<CMsgPracticeLobbyCreate>((uint)EDOTAGCMsg.k_EMsgGCPracticeLobbyCreate);
+            request.Body.lobby_details = new CMsgPracticeLobbySetDetails();
+            request.Body.lobby_details.game_mode = (uint)gamemode;
+            request.Body.lobby_details.game_name = name;
+            request.Body.lobby_details.pass_key = password;
+            request.Body.lobby_details.server_region = (uint)region;
 
-            coordinator.Send(requestMatch, APPID);
+            coordinator.Send(request, APPID);
 
             if (isDebug)
                 Console.WriteLine("Lobby is created!");
+
+            Waiting();
+        }
+
+        public void LeaveLobby()
+        {
+            var requestMatch = new ClientGCMsgProtobuf<CMsgPracticeLobbyLeave>((uint)EDOTAGCMsg.k_EMsgGCPracticeLobbyLeave);
+            coordinator.Send(requestMatch, APPID);
+
+            if (isDebug)
+                Console.WriteLine("getting out lobby!");
 
             Waiting();
         }
@@ -218,10 +398,14 @@ namespace DotaAPI
             invite.Body.steam_id = steam_id;
 
             coordinator.Send(invite, APPID);
+            if (isDebug)
+            {
+                Console.WriteLine("Invited!");
+            }
             Waiting();
         }
 
-        public void GetPlayerData(uint steam_id)
+        public ProfileCard GetDotaProfile(uint steam_id)
         {
             var request =
                 new ClientGCMsgProtobuf<CMsgClientToGCGetProfileCard>((uint)EDOTAGCMsg.k_EMsgClientToGCGetProfileCard);
@@ -229,54 +413,17 @@ namespace DotaAPI
 
             coordinator.Send(request, APPID);
             Waiting();
+            var p = profile;
+            profile = null;
+            return p;
+
         }
 
         private void OnProfileRequest(IPacketGCMsg packetMsg)
         {
-            var msg = new ClientGCMsgProtobuf<CMsgDOTAProfileCard>(packetMsg);
-            ProfileCard p;
-            try
-            {
-                p = new()
-                {
-                    AccountId = msg.Body.account_id,
-                    BandgePoints = msg.Body.badge_points,
-                    IsPlusSubscriber = msg.Body.is_plus_subscriber,
-                    RankTier = msg.Body.rank_tier,
-                    RankTierMmrType = msg.Body.rank_tier_mmr_type,
-                    EventId = msg.Body.event_id,
-                    EventPoints = msg.Body.event_points,
-                    FavoriteTeamPacked = msg.Body.favorite_team_packed,
-                    LeaderboardRank = msg.Body.leaderboard_rank,
-                    LeaderboardRankCore = msg.Body.leaderboard_rank_core,
-                    PlusOriginalStartDate = msg.Body.plus_original_start_date,
-                    PreviousRankTier = msg.Body.previous_rank_tier,
-                    RankTierPeak = msg.Body.rank_tier_peak,
-                    RankTierScore = msg.Body.rank_tier_score
-                };
-            }
-                
-            catch
-            {
-                p = new()
-                {
-                    AccountId = 0
-                };
-            }
-            profile = p;
-        }
-        
-/*        public void JoinTeam(DOTA_GC_TEAM team, uint slot = 1, DOTABotDifficulty botDifficulty = DOTABotDifficulty.BOT_DIFFICULTY_EXTRA3)
-        {
-            var joinSlot =
-                new ClientGCMsgProtobuf<CMsgPracticeLobbySetTeamSlot>((uint)EDOTAGCMsg.k_EMsgGCPracticeLobbySetTeamSlot);
-            joinSlot.Body.team = team;
-            joinSlot.Body.slot = slot;
+            profile = new(packetMsg);
 
-            coordinator.Send(joinSlot, APPID);
-            if (isDebug)
-                Console.WriteLine("changed team");
-        }*/
+        }
 
     }   
 }
